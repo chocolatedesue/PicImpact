@@ -2,6 +2,7 @@ node_modules
 *.log
 dist
 .output
+data/paper-imports/
 .idea/
 .vercel/
 **/skills/**
@@ -17,6 +18,8 @@ tsconfig.tsbuildinfo
 
 # local env files
 .env
+.env*
+!.env.example
 
 # nextjs --experimental-https cert file
 certificates

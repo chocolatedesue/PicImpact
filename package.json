@@ -22,6 +22,7 @@
     "prisma:deploy": "npx prisma migrate deploy",
     "prisma:push": "npx prisma db push --accept-data-loss",
     "prisma:seed": "npx prisma db seed",
+    "paper:import": "tsx scripts/import-paper-ocr.ts",
     "preprocess:backfill": "tsx --conditions=react-server scripts/preprocess-backfill.ts",
     "prebuild": "npx prisma generate"
   },
