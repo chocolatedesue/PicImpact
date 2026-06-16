@@ -17,11 +17,16 @@ const MAX_POLL_ATTEMPTS = 360
 const DEFAULT_UPLOAD_CONCURRENCY = 4
 
 type Args = {
-  pdfUrl: string
+  pdfUrl?: string
+  pdfFile?: string
+  sourceUrl?: string
   dryRun: boolean
   refreshOcr: boolean
   includeOutputImages: boolean
+  skipPreprocess: boolean
   slug?: string
+  albumValue?: string
+  albumName?: string
   uploadConcurrency: number
 }
 
@@ -145,7 +150,13 @@ const emptyExif = {
 
 function usage(): never {
   console.info(`Usage:
-  pnpm paper:import -- --pdf-url <url> [--dry-run] [--refresh-ocr] [--slug <slug>] [--upload-concurrency 4] [--include-output-images]
+  pnpm paper:import -- --pdf-url <url>
+  pnpm paper:import -- --pdf-file <path>
+
+Options:
+  [--dry-run] [--refresh-ocr] [--slug <slug>] [--album-value /sn]
+  [--album-name "Satellite Network (SN) Figures"] [--upload-concurrency 4]
+  [--include-output-images] [--skip-preprocess] [--source-url <url>]
 
 Environment:
   PADDLEOCR_TOKEN
@@ -161,10 +172,10 @@ Environment:
 function parseArgs(argv: string[]): Args {
   if (argv[0] === '--') argv = argv.slice(1)
   const args: Args = {
-    pdfUrl: '',
     dryRun: false,
     refreshOcr: false,
     includeOutputImages: false,
+    skipPreprocess: false,
     uploadConcurrency: DEFAULT_UPLOAD_CONCURRENCY,
   }
 
@@ -183,13 +194,37 @@ function parseArgs(argv: string[]): Args {
       args.includeOutputImages = true
       continue
     }
+    if (arg === '--skip-preprocess') {
+      args.skipPreprocess = true
+      continue
+    }
     if (arg === '--pdf-url') {
-      args.pdfUrl = argv[i + 1] ?? ''
+      args.pdfUrl = argv[i + 1] ?? undefined
+      i += 1
+      continue
+    }
+    if (arg === '--pdf-file') {
+      args.pdfFile = argv[i + 1] ?? undefined
+      i += 1
+      continue
+    }
+    if (arg === '--source-url') {
+      args.sourceUrl = argv[i + 1] ?? undefined
       i += 1
       continue
     }
     if (arg === '--slug') {
       args.slug = argv[i + 1] ?? ''
+      i += 1
+      continue
+    }
+    if (arg === '--album-value') {
+      args.albumValue = argv[i + 1] ?? ''
+      i += 1
+      continue
+    }
+    if (arg === '--album-name') {
+      args.albumName = argv[i + 1] ?? ''
       i += 1
       continue
     }
@@ -201,11 +236,17 @@ function parseArgs(argv: string[]): Args {
     throw new Error(`Unknown argument: ${arg}`)
   }
 
-  if (!args.pdfUrl) {
-    throw new Error('Missing required --pdf-url')
+  if (!args.pdfUrl && !args.pdfFile) {
+    throw new Error('Missing required --pdf-url or --pdf-file')
   }
-  if (!args.pdfUrl.startsWith('http')) {
+  if (args.pdfUrl && !args.pdfUrl.startsWith('http')) {
     throw new Error('--pdf-url must be an http(s) URL for PaddleOCR fileUrl mode')
+  }
+  if (args.pdfFile && !existsSync(args.pdfFile)) {
+    throw new Error(`PDF file not found: ${args.pdfFile}`)
+  }
+  if (args.albumValue && !args.albumValue.startsWith('/')) {
+    throw new Error('--album-value must start with /')
   }
   if (!Number.isInteger(args.uploadConcurrency) || args.uploadConcurrency < 1 || args.uploadConcurrency > 8) {
     throw new Error('--upload-concurrency must be an integer from 1 to 8')
@@ -258,8 +299,15 @@ function sanitizeFilename(input: string, fallback: string): string {
   return `${stem || fallback}${ext || ''}`
 }
 
-function extractDoiCandidate(pdfUrl: string): string {
-  const decoded = decodeURIComponent(pdfUrl)
+function shouldImportMarkdownImage(sourceKey: string): boolean {
+  const normalized = sourceKey.toLowerCase()
+  if (normalized.includes('header_image_box')) return false
+  if (normalized.includes('logo')) return false
+  return true
+}
+
+function extractDoiCandidate(input: string): string {
+  const decoded = decodeURIComponent(input)
   const dagstuhlMatch = decoded.match(/\/((?:OASIcs|LIPIcs|DagRep)\.[A-Za-z0-9.-]+)\.pdf(?:$|\?)/)
   if (dagstuhlMatch?.[1]) {
     return `10.4230/${dagstuhlMatch[1]}`
@@ -398,28 +446,57 @@ async function fetchDagstuhlMetadata(doi: string, pdfUrl: string): Promise<Parti
   }
 }
 
-async function resolvePaperMetadata(pdfUrl: string): Promise<PaperMetadata> {
-  const doi = extractDoiCandidate(pdfUrl)
-  const dagstuhl = await fetchDagstuhlMetadata(doi, pdfUrl)
+function resolveLocalPdfMetadata(pdfFile: string): Partial<PaperMetadata> {
+  const result = spawnSync('pdfinfo', [pdfFile], {
+    encoding: 'utf8',
+    timeout: 30000,
+    maxBuffer: 1024 * 1024,
+  })
+  if (result.status !== 0) return {}
+  const rows = new Map<string, string>()
+  for (const line of result.stdout.split(/\r?\n/)) {
+    const index = line.indexOf(':')
+    if (index <= 0) continue
+    rows.set(line.slice(0, index).trim(), line.slice(index + 1).trim())
+  }
+  const subject = rows.get('Subject') ?? ''
+  const doi = extractDoiCandidate(subject)
+  const year = (subject.match(/\b(20\d{2})\b/) ?? rows.get('Title')?.match(/\b(20\d{2})\b/))?.[1] ?? ''
+  return {
+    title: rows.get('Title') || path.basename(pdfFile, path.extname(pdfFile)),
+    authors: rows.get('Author')?.split(';').map((author) => author.trim()).filter(Boolean) ?? [],
+    year,
+    venue: subject.split(';')[0]?.replace(/\s+/g, ' ').trim() ?? '',
+    doi,
+    url: pdfFile,
+  }
+}
+
+async function resolvePaperMetadata(input: string, pdfFile?: string): Promise<PaperMetadata> {
+  const doi = extractDoiCandidate(input)
+  const local = pdfFile ? resolveLocalPdfMetadata(pdfFile) : {}
+  const effectiveDoi = local.doi || doi
+  const dagstuhl = await fetchDagstuhlMetadata(effectiveDoi, input)
   if (dagstuhl.title) {
     return {
       title: dagstuhl.title,
       authors: dagstuhl.authors ?? [],
       year: dagstuhl.year || '2026',
       venue: dagstuhl.venue || '1st New Ideas in Networked Systems (NINeS 2026)',
-      doi: dagstuhl.doi || doi,
-      url: dagstuhl.url || pdfUrl,
+      doi: dagstuhl.doi || effectiveDoi,
+      url: dagstuhl.url || input,
       abstract: dagstuhl.abstract,
     }
   }
-  const lookedUp = runPaperSearch(doi)
+  const lookedUp = runPaperSearch(effectiveDoi)
+  const preferLocal = Boolean(pdfFile && local.title)
   return {
-    title: lookedUp.title || DEFAULT_PAPER_TITLE,
-    authors: lookedUp.authors ?? [],
-    year: lookedUp.year || '',
-    venue: lookedUp.venue || '',
-    doi: lookedUp.doi || doi,
-    url: lookedUp.url || pdfUrl,
+    title: (preferLocal ? local.title : lookedUp.title) || lookedUp.title || local.title || DEFAULT_PAPER_TITLE,
+    authors: lookedUp.authors ?? local.authors ?? [],
+    year: local.year || lookedUp.year || '',
+    venue: local.venue || lookedUp.venue || '',
+    doi: local.doi || lookedUp.doi || effectiveDoi,
+    url: input || lookedUp.url || local.url || '',
     abstract: lookedUp.abstract,
   }
 }
@@ -527,7 +604,11 @@ async function downloadPdf(pdfUrl: string, outputFile: string): Promise<void> {
   await fs.writeFile(outputFile, Buffer.from(await response.arrayBuffer()))
 }
 
-async function submitOcrJob(pdfUrl: string, token: string, importDir: string): Promise<string> {
+async function submitOcrJob(pdfUrl: string | undefined, pdfFile: string | undefined, token: string, importDir: string): Promise<string> {
+  if (pdfFile) {
+    return await submitOcrJobFromFile(pdfFile, token)
+  }
+  if (!pdfUrl) throw new Error('Missing PDF URL')
   try {
     return await submitOcrJobFromUrl(pdfUrl, token)
   } catch (error) {
@@ -615,6 +696,7 @@ async function parseOcrAssets(
         url: string
       }> = []
       for (const [key, url] of Object.entries(layout.markdown?.images ?? {})) {
+        if (!shouldImportMarkdownImage(key)) continue
         downloadEntries.push({ sourceType: 'markdown', key, url })
       }
       if (includeOutputImages) {
@@ -745,6 +827,7 @@ async function ensureAlbum(
   cookie: string,
   manifest: Manifest,
   albumValue: string,
+  albumName?: string,
 ): Promise<void> {
   const albums = await apiRequest<Album[]>(baseUrl, cookie, '/api/v1/albums')
   const existing = albums.find((album) => album.album_value === albumValue)
@@ -763,7 +846,7 @@ async function ensureAlbum(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      name: paper.title || DEFAULT_PAPER_TITLE,
+      name: albumName || paper.title || DEFAULT_PAPER_TITLE,
       album_value: albumValue,
       detail,
       sort: 0,
@@ -778,7 +861,7 @@ async function ensureAlbum(
   const refreshed = await apiRequest<Album[]>(baseUrl, cookie, '/api/v1/albums')
   const created = refreshed.find((album) => album.album_value === albumValue)
   manifest.album = {
-    name: created?.name ?? paper.title,
+    name: created?.name ?? albumName ?? paper.title,
     albumValue,
     id: created?.id,
   }
@@ -1041,9 +1124,11 @@ async function main(): Promise<void> {
   if (!token) throw new Error('Missing PADDLEOCR_TOKEN')
 
   const baseUrl = (env.PICIMPACT_BASE_URL || DEFAULT_BASE_URL).replace(/\/+$/, '')
-  const paper = await resolvePaperMetadata(args.pdfUrl)
+  const pdfFile = args.pdfFile ? path.resolve(args.pdfFile) : undefined
+  const pdfInput = args.sourceUrl ?? args.pdfUrl ?? path.resolve(args.pdfFile ?? '')
+  const paper = await resolvePaperMetadata(pdfInput, pdfFile)
   const slug = slugify(args.slug || paper.title || DEFAULT_SLUG)
-  const albumValue = `/papers/${slug}`
+  const albumValue = args.albumValue || `/papers/${slug}`
   const importDir = path.join(resolveImportRoot(), slug)
   const ocrJsonlFile = path.join(importDir, 'ocr.jsonl')
   const manifestFile = path.join(importDir, 'manifest.json')
@@ -1051,20 +1136,20 @@ async function main(): Promise<void> {
   await ensureDir(importDir)
   const existingManifest = await readJsonFile<Manifest>(manifestFile)
   const manifest: Manifest = existingManifest ?? {
-    pdfUrl: args.pdfUrl,
+    pdfUrl: pdfInput,
     createdAt: nowIso(),
     updatedAt: nowIso(),
-    doiCandidate: extractDoiCandidate(args.pdfUrl),
+    doiCandidate: extractDoiCandidate(pdfInput),
     paper,
     images: [],
   }
-  manifest.pdfUrl = args.pdfUrl
+  manifest.pdfUrl = pdfInput
   manifest.paper = { ...manifest.paper, ...paper }
   manifest.updatedAt = nowIso()
 
   if (args.refreshOcr || !existsSync(ocrJsonlFile)) {
     console.info('Submitting PaddleOCR job...')
-    const jobId = await submitOcrJob(args.pdfUrl, token, importDir)
+    const jobId = await submitOcrJob(args.pdfUrl, pdfFile, token, importDir)
     manifest.ocrJobId = jobId
     manifest.updatedAt = nowIso()
     await writeJsonFile(manifestFile, manifest)
@@ -1092,13 +1177,17 @@ async function main(): Promise<void> {
 
   const cookie = await login(baseUrl, env)
   const storage = await detectStorage(baseUrl, cookie, env)
-  await ensureAlbum(baseUrl, cookie, manifest, albumValue)
+  await ensureAlbum(baseUrl, cookie, manifest, albumValue, args.albumName)
   manifest.updatedAt = nowIso()
   await writeJsonFile(manifestFile, manifest)
   console.info(`Using album ${manifest.album?.albumValue} and storage ${storage}.`)
 
   await uploadImages(baseUrl, cookie, storage, importDir, manifestFile, manifest, args.uploadConcurrency)
-  await runPreprocessTask(baseUrl, cookie)
+  if (args.skipPreprocess) {
+    console.info('Skipping preprocess task; run pnpm run preprocess:backfill after batch imports.')
+  } else {
+    await runPreprocessTask(baseUrl, cookie)
+  }
   const uploadedCount = manifest.images.filter((image) => image.uploaded).length
   const failedCount = manifest.images.filter((image) => image.error && !image.uploaded).length
   console.info(`Import complete: ${uploadedCount}/${manifest.images.length} uploaded, ${failedCount} failed.`)
