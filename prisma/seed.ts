@@ -1,4 +1,5 @@
 import { PrismaClient } from '@prisma/client'
+import bcrypt from 'bcryptjs'
 
 const prisma = new PrismaClient()
 
@@ -55,6 +56,40 @@ export async function main() {
           skipDuplicates: true,
         })
       })
+
+      // 从环境变量创建初始管理员（如果有配置）
+      const adminEmail = process.env.ADMIN_EMAIL
+      const adminPassword = process.env.ADMIN_PASSWORD
+      if (adminEmail && adminPassword) {
+        const existingUser = await prisma.user.findUnique({ where: { email: adminEmail } })
+        if (!existingUser) {
+          const hashedPassword = await bcrypt.hash(adminPassword, 10)
+          const userId = crypto.randomUUID()
+          await prisma.$transaction(async (tx) => {
+            await tx.user.create({
+              data: {
+                id: userId,
+                name: 'admin',
+                email: adminEmail,
+                emailVerified: true,
+              },
+            })
+            await tx.account.create({
+              data: {
+                id: crypto.randomUUID(),
+                accountId: adminEmail,
+                providerId: 'credential',
+                userId,
+                password: hashedPassword,
+              },
+            })
+          })
+          console.log(`Admin user created: ${adminEmail}`)
+        } else {
+          console.log(`Admin user already exists: ${adminEmail}`)
+        }
+      }
+
       console.log('action boot completed.')
     } else {
       console.error('Database initialization failed, please check your connection information.')
